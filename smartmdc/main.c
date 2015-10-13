@@ -78,38 +78,38 @@ static adcsample_t filteredABCD[4] = {0, 0, 0, 0};
  * ADC streaming callback for A and D channels.
  */
 static void adccallbackAD(ADCDriver *adcp, adcsample_t *buffer, size_t n) {
-  uint32_t sumA, sumD = 0;
-  size_t i = 0;
+  uint32_t sumA = 0;
+  uint32_t sumD = 0;
+  size_t n2 = n / ADC_GRP1_NUM_CHANNELS;
 
   (void)adcp;
   do {
-    sumA += (uint32_t) buffer[i];
-    i++;
-    sumD += (uint32_t) buffer[i];
-    i++;
-  } while (i < n);
+    sumA += *buffer++;
+    sumD += *buffer++;
+    n -= ADC_GRP1_NUM_CHANNELS;
+  } while (n);
 
-  filteredABCD[DVD_CHANNEL_A] = sumA / n;
-  filteredABCD[DVD_CHANNEL_D] = sumD / n;
+  filteredABCD[DVD_CHANNEL_A] = (adcsample_t)(sumA / n2);
+  filteredABCD[DVD_CHANNEL_D] = (adcsample_t)(sumD / n2);
 }
 
 /*
  * ADC streaming callback for C and B channels.
  */
 static void adccallbackCB(ADCDriver *adcp, adcsample_t *buffer, size_t n) {
-  uint32_t sumC, sumB = 0;
-  size_t i = 0;
+  uint32_t sumC = 0;
+  uint32_t sumB = 0;
+  size_t n2 = n / ADC_GRP2_NUM_CHANNELS;
 
   (void)adcp;
   do {
-    sumC += (uint32_t) buffer[i];
-    i++;
-    sumB += (uint32_t) buffer[i];
-    i++;
-  } while (i < n);
+    sumC += *buffer++;
+    sumB += *buffer++;
+    n -= ADC_GRP2_NUM_CHANNELS;
+  } while (n);
 
-  filteredABCD[DVD_CHANNEL_C] = sumC / n;
-  filteredABCD[DVD_CHANNEL_B] = sumB / n;
+  filteredABCD[DVD_CHANNEL_C] = (adcsample_t)(sumC / n2);
+  filteredABCD[DVD_CHANNEL_B] = (adcsample_t)(sumB / n2);
 }
 
 /*
