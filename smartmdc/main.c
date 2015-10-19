@@ -196,9 +196,6 @@ static AccDataStruct rawData = {0, 0, 0};
 /* Filtered accel data. */
 static AccDataStruct filteredData = {0, 0, 0};
 
-/* Forward declarations. */
-void processCommands(void);
-
 /*
  * Blinker thread (low priority).
  */
@@ -239,6 +236,37 @@ static THD_FUNCTION(AccPoller, arg) {
     }
     /* Wait until the next 5 milliseconds passes. */
     chThdSleepUntil(time += MS2ST(5));
+  }
+}
+
+/*
+ *
+ */
+static void processCommands(void)
+{
+  uint16_t tmp16;
+
+  uint8_t ch = chnGetTimeout(g_chnp, TIME_IMMEDIATE);
+
+  switch (ch) {
+  case 'a': /* Sends raw accelerometer data. */
+    chnWrite(g_chnp, (const uint8_t *)&filteredData, sizeof(filteredData));
+    break;
+  case 'b': /* Sends raw four segment data. */
+    chnWrite(g_chnp, (const uint8_t *)&filteredABCD, sizeof(filteredABCD));
+    break;
+  case '1': /* Updates position of the FOC actuator (0x31 hex; 49 dec). */
+    chnRead(g_chnp, (uint8_t *)&tmp16, sizeof(tmp16));
+    tmp16 &= 0x0FFF; /* Limit to 12 bits right alligned. */
+    dacPutChannelX(&DACD1, DAC_CHANNEL_FOC, tmp16);
+    break;
+  case '2': /* Updates position of the RAD actuator (0x32 hex; 50 dec). */
+    chnRead(g_chnp, (uint8_t *)&tmp16, sizeof(tmp16));
+    tmp16 &= 0x0FFF; /* Limit to 12 bits right alligned. */
+    dacPutChannelX(&DACD2, DAC_CHANNEL_RAD, tmp16);
+    break;
+  default:  /* Unknown message or timeout or queue reset. */
+    chThdSleepMilliseconds(TELEMETRY_SLEEP_MS);
   }
 }
 
@@ -318,37 +346,8 @@ int main(void) {
 
     if (g_chnp) {
       processCommands();
+    } else {
+      chThdSleepMilliseconds(1000);
     }
-
-    chThdSleepMilliseconds(TELEMETRY_SLEEP_MS);
-  }
-}
-
-/*
- *
- */
-void processCommands(void)
-{
-  uint8_t ch = chnGetTimeout(g_chnp, TIME_IMMEDIATE);
-  uint16_t tmp16;
-
-  switch (ch) {
-  case 'a': /* Sends raw accelerometer data. */
-    chnWrite(g_chnp, (const uint8_t *)&filteredData, sizeof(filteredData));
-    break;
-  case 'b': /* Sends raw four segment data. */
-    chnWrite(g_chnp, (const uint8_t *)&filteredABCD, sizeof(filteredABCD));
-    break;
-  case '1': /* Updates position of the FOC actuator (0x31 hex; 49 dec). */
-    chnRead(g_chnp, (uint8_t *)&tmp16, sizeof(tmp16));
-    tmp16 &= 0x0FFF; /* Limit to 12 bits right alligned. */
-    dacPutChannelX(&DACD1, DAC_CHANNEL_FOC, tmp16);
-    break;
-  case '2': /* Updates position of the RAD actuator (0x32 hex; 50 dec). */
-    chnRead(g_chnp, (uint8_t *)&tmp16, sizeof(tmp16));
-    tmp16 &= 0x0FFF; /* Limit to 12 bits right alligned. */
-    dacPutChannelX(&DACD2, DAC_CHANNEL_RAD, tmp16);
-    break;
-  default:; /* Unknown message or timeout or queue reset. */
   }
 }
