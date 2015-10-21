@@ -33,11 +33,11 @@
 
 /* ADC1_2 conversion group. */
 #define ADC_GRP1_NUM_CHANNELS   2
-#define ADC_GRP1_BUF_DEPTH      64
+#define ADC_GRP1_BUF_DEPTH      128
 
 /* ADC3_4 conversion group. */
 #define ADC_GRP2_NUM_CHANNELS   2
-#define ADC_GRP2_BUF_DEPTH      64
+#define ADC_GRP2_BUF_DEPTH      128
 
 #define DVD_CHANNEL_A           0
 #define DVD_CHANNEL_B           3
@@ -76,6 +76,16 @@ static adcsample_t samplesAD[ADC_GRP1_NUM_CHANNELS * ADC_GRP1_BUF_DEPTH];
 static adcsample_t samplesCB[ADC_GRP2_NUM_CHANNELS * ADC_GRP2_BUF_DEPTH];
 /* Filtered values of A, B, C and D channels. */
 static adcsample_t filteredABCD[4] = {0, 0, 0, 0};
+static int16_t sumAD = 0;
+static int16_t sumCB = 0;
+static int16_t diffAD = 0;
+static int16_t diffCB = 0;
+
+static int32_t sum4Seg = 0;
+static int32_t diff4Seg = 0;
+
+/* Counting semaphore for ADC synchronization. */
+SEMAPHORE_DECL(semADCReady, 2);
 
 /*
  * ADC streaming callback for A and D channels.
@@ -84,6 +94,7 @@ static void adccallbackAD(ADCDriver *adcp, adcsample_t *buffer, size_t n) {
   uint32_t sumA = 0;
   uint32_t sumD = 0;
   size_t n2 = n / ADC_GRP1_NUM_CHANNELS;
+  adcsample_t avgA, avgD;
 
   (void)adcp;
   do {
@@ -92,8 +103,14 @@ static void adccallbackAD(ADCDriver *adcp, adcsample_t *buffer, size_t n) {
     n -= ADC_GRP1_NUM_CHANNELS;
   } while (n);
 
-  filteredABCD[DVD_CHANNEL_A] = (adcsample_t)(sumA / n2);
-  filteredABCD[DVD_CHANNEL_D] = (adcsample_t)(sumD / n2);
+  avgA = (adcsample_t)(sumA / n2);
+  avgD = (adcsample_t)(sumD / n2);
+  filteredABCD[DVD_CHANNEL_A] = avgA;
+  filteredABCD[DVD_CHANNEL_D] = avgD;
+  sumAD = avgA + avgD;
+  diffAD = avgA - avgD;
+  /* Change state of the synchronizing semaphore. */
+  chSemSignalI(&semADCReady);
 }
 
 /*
@@ -103,6 +120,7 @@ static void adccallbackCB(ADCDriver *adcp, adcsample_t *buffer, size_t n) {
   uint32_t sumC = 0;
   uint32_t sumB = 0;
   size_t n2 = n / ADC_GRP2_NUM_CHANNELS;
+  adcsample_t avgC, avgB;
 
   (void)adcp;
   do {
@@ -111,8 +129,14 @@ static void adccallbackCB(ADCDriver *adcp, adcsample_t *buffer, size_t n) {
     n -= ADC_GRP2_NUM_CHANNELS;
   } while (n);
 
-  filteredABCD[DVD_CHANNEL_C] = (adcsample_t)(sumC / n2);
-  filteredABCD[DVD_CHANNEL_B] = (adcsample_t)(sumB / n2);
+  avgC = (adcsample_t)(sumC / n2);
+  avgB = (adcsample_t)(sumB / n2);
+  filteredABCD[DVD_CHANNEL_C] = avgC;
+  filteredABCD[DVD_CHANNEL_B] = avgB;
+  sumCB = avgC + avgB;
+  diffCB = avgC - avgB;
+  /* Change state of the synchronizing semaphore. */
+  chSemSignalI(&semADCReady);
 }
 
 /*
@@ -215,7 +239,7 @@ static THD_FUNCTION(Blinker, arg) {
 }
 
 /*
- * Accel poller thread (highest priority).
+ * Accel poller thread (high priority).
  */
 static THD_WORKING_AREA(waAccPoller, 256);
 static THD_FUNCTION(AccPoller, arg) {
@@ -240,13 +264,28 @@ static THD_FUNCTION(AccPoller, arg) {
 }
 
 /*
+ * ADC data processing thread (the highest priority).
+ */
+static THD_WORKING_AREA(waADCProcessor, 512);
+static THD_FUNCTION(ADCProcessor, arg) {
+  (void)arg;
+
+  while (true) {
+    if (chSemWait(&semADCReady) == MSG_OK) {
+      sum4Seg  = sumAD + sumCB;
+      /* (A-D)-(B-C) = A-D-B+C = A-D+C-B = (A-D)+(C-B); */
+      diff4Seg = diffAD + diffCB;
+    }
+  }
+}
+
+/*
  *
  */
 static void processCommands(void)
 {
-  uint16_t tmp16;
-
-  uint8_t ch = chnGetTimeout(g_chnp, TIME_IMMEDIATE);
+  uint16_t utmp16;
+  uint8_t  ch = chnGetTimeout(g_chnp, TIME_IMMEDIATE);
 
   switch (ch) {
   case 'a': /* Sends raw accelerometer data. */
@@ -255,15 +294,19 @@ static void processCommands(void)
   case 'b': /* Sends raw four segment data. */
     chnWrite(g_chnp, (const uint8_t *)&filteredABCD, sizeof(filteredABCD));
     break;
+  case 'c': /* Sends sum and difference of four segment data. */
+    chnWrite(g_chnp, (const uint8_t *)&sum4Seg, sizeof(sum4Seg));
+    chnWrite(g_chnp, (const uint8_t *)&diff4Seg, sizeof(diff4Seg));
+    break;
   case '1': /* Updates position of the FOC actuator (0x31 hex; 49 dec). */
-    chnRead(g_chnp, (uint8_t *)&tmp16, sizeof(tmp16));
-    tmp16 &= 0x0FFF; /* Limit to 12 bits right alligned. */
-    dacPutChannelX(&DACD1, DAC_CHANNEL_FOC, tmp16);
+    chnRead(g_chnp, (uint8_t *)&utmp16, sizeof(utmp16));
+    utmp16 &= 0x0FFF; /* Limit to 12 bits right alligned. */
+    dacPutChannelX(&DACD1, DAC_CHANNEL_FOC, utmp16);
     break;
   case '2': /* Updates position of the RAD actuator (0x32 hex; 50 dec). */
-    chnRead(g_chnp, (uint8_t *)&tmp16, sizeof(tmp16));
-    tmp16 &= 0x0FFF; /* Limit to 12 bits right alligned. */
-    dacPutChannelX(&DACD2, DAC_CHANNEL_RAD, tmp16);
+    chnRead(g_chnp, (uint8_t *)&utmp16, sizeof(utmp16));
+    utmp16 &= 0x0FFF; /* Limit to 12 bits right alligned. */
+    dacPutChannelX(&DACD2, DAC_CHANNEL_RAD, utmp16);
     break;
   default:  /* Unknown message or timeout or queue reset. */
     chThdSleepMilliseconds(TELEMETRY_SLEEP_MS);
@@ -318,25 +361,30 @@ int main(void) {
   adcStart(&ADCD3, NULL);
 
   /*
-   * Creates the blinker thread.
-   */
-  chThdCreateStatic(waBlinker, sizeof(waBlinker), LOWPRIO, Blinker, NULL);
-
-  /*
    * Initialize MMA8451Q accelerometer.
    */
   if (mma8451Init(MMA8451_ADDR)) {
-    /* Creates the accelerometer poller thread. */
-    chThdCreateStatic(waAccPoller, sizeof(waAccPoller), HIGHPRIO, AccPoller, NULL);
+    /* Creates the accelerometer polling thread. */
+    chThdCreateStatic(waAccPoller, sizeof(waAccPoller), NORMALPRIO + 1, AccPoller, NULL);
   } else {
     palSetPad(GPIOB, GPIOB_LED_B);
   }
+  
+  /*
+   * Creates the ADC data processing thread.
+   */
+  chThdCreateStatic(waADCProcessor, sizeof(waADCProcessor), HIGHPRIO, ADCProcessor, NULL);
 
   /*
    * Starts an ADC continuous conversion.
    */
   adcStartConversion(&ADCD1, &adcgrpcfg1, samplesAD, ADC_GRP1_BUF_DEPTH);
   adcStartConversion(&ADCD3, &adcgrpcfg2, samplesCB, ADC_GRP2_BUF_DEPTH);
+
+  /*
+   * Creates the blinker thread.
+   */
+  chThdCreateStatic(waBlinker, sizeof(waBlinker), LOWPRIO, Blinker, NULL);
 
   /*
    * Normal main() thread activity.
