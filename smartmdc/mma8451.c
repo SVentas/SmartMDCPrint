@@ -65,9 +65,7 @@ bool mma8451Init(i2caddr_t addr) {
   txbuf[0] = MMA8451_CTRL_REG1; /* register address */
   txbuf[1] = 0x11; /* ODR = 200Hz; ACTIVE = 1 */
 
-  i2cAcquireBus(&I2CD1);
   status = i2cMasterTransmitTimeout(&I2CD1, addr, txbuf, 2, rxbuf, 0, MMA8451_TRANSMIT_TIMEOUT);
-  i2cReleaseBus(&I2CD1);
 
   if (status != MSG_OK){
     errors = i2cGetErrors(&I2CD1);
@@ -86,9 +84,7 @@ bool mma8451GetNewData(i2caddr_t addr, PAccDataStruct pData) {
 
   txbuf[0] = MMA8451_OUT_DATA; /* register address */
 
-  i2cAcquireBus(&I2CD1);
   status = i2cMasterTransmitTimeout(&I2CD1, addr, txbuf, 1, rxbuf, 6, MMA8451_TRANSMIT_TIMEOUT);
-  i2cReleaseBus(&I2CD1);
 
   if (status != MSG_OK){
     errors = i2cGetErrors(&I2CD1);
