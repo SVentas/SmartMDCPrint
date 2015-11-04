@@ -141,7 +141,7 @@ static void adccallbackCB(ADCDriver *adcp, adcsample_t *buffer, size_t n) {
 
 /*
  * ADC1_2 conversion group.
- * Mode:        Continuous, 16 samples of 2 channels, SW triggered.
+ * Mode:        Continuous, 32 samples of 2 channels, SW triggered, 29316 Sps.
  * Channels:    ADC1_CH1-(A), ADC2_CH3-(D).
  */
 static const ADCConversionGroup adcgrpcfg1 = {
@@ -176,7 +176,7 @@ static const ADCConversionGroup adcgrpcfg1 = {
 
 /*
  * ADC3_4 conversion group.
- * Mode:        Continuous, 16 samples of 2 channels, SW triggered.
+ * Mode:        Continuous, 32 samples of 2 channels, SW triggered, 29316 Sps.
  * Channels:    ADC3_CH5-(C), ADC4_CH4-(B).
  */
 static const ADCConversionGroup adcgrpcfg2 = {
