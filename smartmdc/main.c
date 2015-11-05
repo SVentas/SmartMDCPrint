@@ -31,18 +31,15 @@
 #define DAC_CHANNEL_FOC         0U
 #define DAC_CHANNEL_RAD         1U
 
+#define ADC_BUFFER_DEPTH        16
+
 /* ADC1_2 conversion group. */
 #define ADC_GRP1_NUM_CHANNELS   2
-#define ADC_GRP1_BUF_DEPTH      128
+#define ADC_GRP1_BUF_DEPTH      (ADC_BUFFER_DEPTH * 2)
 
 /* ADC3_4 conversion group. */
 #define ADC_GRP2_NUM_CHANNELS   2
-#define ADC_GRP2_BUF_DEPTH      128
-
-#define DVD_CHANNEL_A           0
-#define DVD_CHANNEL_B           3
-#define DVD_CHANNEL_C           2
-#define DVD_CHANNEL_D           1
+#define ADC_GRP2_BUF_DEPTH      (ADC_BUFFER_DEPTH * 2)
 
 /* Telemetry sleep time in ms. */
 #define TELEMETRY_SLEEP_MS      1
@@ -75,14 +72,12 @@ static adcsample_t samplesAD[ADC_GRP1_NUM_CHANNELS * ADC_GRP1_BUF_DEPTH];
 /* ADC3_4 samples. */
 static adcsample_t samplesCB[ADC_GRP2_NUM_CHANNELS * ADC_GRP2_BUF_DEPTH];
 /* Filtered values of A, B, C and D channels. */
-static adcsample_t filteredABCD[4] = {0, 0, 0, 0};
-static int16_t sumAD = 0;
-static int16_t sumCB = 0;
-static int16_t diffAD = 0;
-static int16_t diffCB = 0;
-
-static int32_t sum4Seg = 0;
-static int32_t diff4Seg = 0;
+static adcsample_t sumAD = 0;
+static adcsample_t sumCB = 0;
+static adcsample_t diffAD = 0;
+static adcsample_t diffCB = 0;
+static adcsample_t sum4Seg = 0;
+static adcsample_t diff4Seg = 0;
 
 /* Counting semaphore for ADC synchronization. */
 SEMAPHORE_DECL(semADCReady, 2);
@@ -93,22 +88,21 @@ SEMAPHORE_DECL(semADCReady, 2);
 static void adccallbackAD(ADCDriver *adcp, adcsample_t *buffer, size_t n) {
   uint32_t sumA = 0;
   uint32_t sumD = 0;
-  size_t n2 = n / ADC_GRP1_NUM_CHANNELS;
+  size_t i = n;
   adcsample_t avgA, avgD;
 
   (void)adcp;
   do {
     sumA += *buffer++;
     sumD += *buffer++;
-    n -= ADC_GRP1_NUM_CHANNELS;
-  } while (n);
+  } while (--i);
 
-  avgA = (adcsample_t)(sumA / n2);
-  avgD = (adcsample_t)(sumD / n2);
-  filteredABCD[DVD_CHANNEL_A] = avgA;
-  filteredABCD[DVD_CHANNEL_D] = avgD;
+  avgA = (adcsample_t)(sumA / n);
+  avgD = (adcsample_t)(sumD / n);
+
   sumAD = avgA + avgD;
   diffAD = avgA - avgD;
+
   /* Change state of the synchronizing semaphore. */
   chSemSignalI(&semADCReady);
 }
@@ -119,29 +113,29 @@ static void adccallbackAD(ADCDriver *adcp, adcsample_t *buffer, size_t n) {
 static void adccallbackCB(ADCDriver *adcp, adcsample_t *buffer, size_t n) {
   uint32_t sumC = 0;
   uint32_t sumB = 0;
-  size_t n2 = n / ADC_GRP2_NUM_CHANNELS;
+  size_t i = n;
   adcsample_t avgC, avgB;
 
   (void)adcp;
   do {
     sumC += *buffer++;
     sumB += *buffer++;
-    n -= ADC_GRP2_NUM_CHANNELS;
-  } while (n);
+  } while (--i);
 
-  avgC = (adcsample_t)(sumC / n2);
-  avgB = (adcsample_t)(sumB / n2);
-  filteredABCD[DVD_CHANNEL_C] = avgC;
-  filteredABCD[DVD_CHANNEL_B] = avgB;
+  avgC = (adcsample_t)(sumC / n);
+  avgB = (adcsample_t)(sumB / n);
+
   sumCB = avgC + avgB;
   diffCB = avgC - avgB;
+
   /* Change state of the synchronizing semaphore. */
   chSemSignalI(&semADCReady);
 }
 
 /*
  * ADC1_2 conversion group.
- * Mode:        Continuous, 32 samples of 2 channels, SW triggered, 29316 Sps.
+ * Mode:        Continuous, 16 samples of 2 channels, SW triggered,
+ *              12 000 000 / 614 = 19544 sps.
  * Channels:    ADC1_CH1-(A), ADC2_CH3-(D).
  */
 static const ADCConversionGroup adcgrpcfg1 = {
@@ -176,7 +170,8 @@ static const ADCConversionGroup adcgrpcfg1 = {
 
 /*
  * ADC3_4 conversion group.
- * Mode:        Continuous, 32 samples of 2 channels, SW triggered, 29316 Sps.
+ * Mode:        Continuous, 32 samples of 2 channels, SW triggered,
+ *              12 000 000 / 614 = 19544 sps.
  * Channels:    ADC3_CH5-(C), ADC4_CH4-(B).
  */
 static const ADCConversionGroup adcgrpcfg2 = {
@@ -273,7 +268,11 @@ static THD_FUNCTION(ADCProcessor, arg) {
   while (true) {
     if (chSemWait(&semADCReady) == MSG_OK) {
       sum4Seg  = sumAD + sumCB;
-      /* (A-D)-(B-C) = A-D-B+C = A-D+C-B = (A-D)+(C-B); */
+      /* (A-D)-(B-C) =
+       *  A-D - B+C  =
+       *  A-D + C-B  =
+       * (A-D)+(C-B);
+       */
       diff4Seg = diffAD + diffCB;
     }
   }
@@ -291,11 +290,10 @@ static void processCommands(void)
   case 'a': /* Sends raw accelerometer data. */
     chnWrite(g_chnp, (const uint8_t *)&filteredData, sizeof(filteredData));
     break;
-  case 'b': /* Sends raw four segment data. */
-    chnWrite(g_chnp, (const uint8_t *)&filteredABCD, sizeof(filteredABCD));
-    break;
-  case 'c': /* Sends sum and difference of four segment data. */
+  case 'b': /* Sends sum of four segment data. */
     chnWrite(g_chnp, (const uint8_t *)&sum4Seg, sizeof(sum4Seg));
+    break;
+  case 'c': /* Sends difference of four segment data. */
     chnWrite(g_chnp, (const uint8_t *)&diff4Seg, sizeof(diff4Seg));
     break;
   case '1': /* Updates position of the FOC actuator (0x31 hex; 49 dec). */
