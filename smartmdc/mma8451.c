@@ -46,18 +46,6 @@ static uint8_t rxbuf[ACCEL_RX_DEPTH];
 static uint8_t txbuf[ACCEL_TX_DEPTH];
 
 /**
- * Converts data from 2complemented representation to signed integer.
- */
-int16_t complement2signed(uint8_t msb, uint8_t lsb) {
-  uint16_t word = 0;
-  word = (msb << 8) + lsb;
-  if (msb > 0x7F){
-    return -1 * ((int16_t)((~word) + 1));
-  }
-  return (int16_t)word;
-}
-
-/**
  * Prepares the accelerometer.
  */
 bool mma8451Init(i2caddr_t addr) {
@@ -123,9 +111,9 @@ bool mma8451GetNewData(i2caddr_t addr, PAccDataStruct pData) {
     return FALSE;
   }
 
-  pData->x = complement2signed(rxbuf[0], rxbuf[1]);
-  pData->y = complement2signed(rxbuf[2], rxbuf[3]);
-  pData->z = complement2signed(rxbuf[4], rxbuf[5]);
+  pData->x = (int16_t)((rxbuf[0] << 8) | rxbuf[1]) / 4;
+  pData->y = (int16_t)((rxbuf[2] << 8) | rxbuf[3]) / 4;
+  pData->z = (int16_t)((rxbuf[4] << 8) | rxbuf[5]) / 4;
 
   return TRUE;
 }

@@ -21,7 +21,7 @@
 #include "mma8451.h"
 
 /* Low-pass filter coefficients. */
-#define ACC_LPF_A               128
+#define ACC_LPF_A               64
 #define ACC_LPF_B               (ACC_LPF_A - 1)
 
 /* DAC channels. */
