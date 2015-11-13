@@ -41,6 +41,12 @@
 /* Telemetry sleep time in ms. */
 #define TELEMETRY_SLEEP_MS      1
 
+/* MACROS */
+#define SYMVAL(sym) (uint32_t)(((uint8_t *)&(sym)) - ((uint8_t *)0))
+
+/* The end of RAM defined in linker script. */
+extern uint32_t __ram0_end__;
+
 /* I2C interface #1 */
 static const I2CConfig i2cfg1 = {
   STM32_TIMINGR_PRESC(15U) |
@@ -178,14 +184,17 @@ SerialUSBDriver SDU1;
 /* Console input/output handle. */
 BaseChannel *g_chnp = NULL;
 
-/* MMA8451Q accelerometer address. */
-static i2caddr_t mma8451Addr = 0;
 /* Main thread termination flag. */
 static bool fRunMain = TRUE;
+
+/* MMA8451Q accelerometer address. */
+static i2caddr_t mma8451Addr = 0;
 /* Raw accel data. */
 static AccDataStruct rawData = {0, 0, 0};
 /* Filtered accel data. */
 static AccDataStruct filteredData = {0, 0, 0};
+/* Temporary higher precission accel data. */
+static int32_t tmpAccData[3] = {0, 0, 0};
 
 /*
  * Blinker thread (low priority).
@@ -210,25 +219,26 @@ static THD_FUNCTION(Blinker, arg) {
 
 /*
  * Accel poller thread (high priority).
+ * This thread is invoked every 2.5 ms (@400 Hz).
  */
 static THD_WORKING_AREA(waAccPoller, 256);
 static THD_FUNCTION(AccPoller, arg) {
   (void)arg;
   systime_t time = chVTGetSystemTime();
-  int32_t temp;
 
   while (!chThdShouldTerminateX()) {
-    if (mma8451GetNewData(mma8451Addr, &rawData) && chMtxTryLock(&m1)) {
-      temp = ((int32_t)filteredData.x * ACC_LPF_B + rawData.x) / ACC_LPF_A;
-      filteredData.x = (int16_t)temp;
+    if (mma8451GetNewData(mma8451Addr, &rawData)) {
+      tmpAccData[0] = (tmpAccData[0] * ACC_LPF_B + (int32_t)rawData.x * 0x0100) / ACC_LPF_A;
+      tmpAccData[1] = (tmpAccData[1] * ACC_LPF_B + (int32_t)rawData.y * 0x0100) / ACC_LPF_A;
+      tmpAccData[2] = (tmpAccData[2] * ACC_LPF_B + (int32_t)rawData.z * 0x0100) / ACC_LPF_A;
 
-      temp = ((int32_t)filteredData.y * ACC_LPF_B + rawData.y) / ACC_LPF_A;
-      filteredData.y = (int16_t)temp;
-
-      temp = ((int32_t)filteredData.z * ACC_LPF_B + rawData.z) / ACC_LPF_A;
-      filteredData.z = (int16_t)temp;
-
-      chMtxUnlock(&m1);
+      if (chMtxTryLock(&m1)) {
+        filteredData.x = (int16_t)(tmpAccData[0] / 0x0100);
+        filteredData.y = (int16_t)(tmpAccData[1] / 0x0100);
+        filteredData.z = (int16_t)(tmpAccData[2] / 0x0100);
+        
+        chMtxUnlock(&m1);
+      }
     }
     /* Wait until the next 2.5 milliseconds passes. */
     chThdSleepUntil(time += US2ST(2500));
@@ -300,11 +310,15 @@ static void processCommands(void)
     chnWrite(g_chnp, (const uint8_t *)&diff4Seg, sizeof(diff4Seg));
     chMtxUnlock(&m1);
     break;
-  case 'd': /* Shuts down the controller. */
+  case 'd': /* Sends I2C error code and number of timeouts. */
     chnWrite(g_chnp, (const uint8_t *)&g_i2cErrors, sizeof(g_i2cErrors));
     chnWrite(g_chnp, (const uint8_t *)&g_i2cTimeouts, sizeof(g_i2cTimeouts));
     break;
-  case 'x': /* Shuts down the controller. */
+  case 'x': /* Shuts down the controller and reboots into bootloader. */
+    /* Place a special mark at the end of RAM as a sign
+     * to enter bootloader.
+     */
+    *((uint32_t *)(SYMVAL(__ram0_end__) - 4)) = 0xDEADBEEF;
     fRunMain = FALSE;
     break;
   case '1': /* Updates position of the FOC actuator (0x31 hex; 49 dec). */

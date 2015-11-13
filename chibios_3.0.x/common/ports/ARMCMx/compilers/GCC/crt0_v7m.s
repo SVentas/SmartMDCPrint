@@ -164,6 +164,13 @@
                 .thumb_func
                 .global Reset_Handler
 Reset_Handler:
+                ldr     r0, =__ram0_end__ - 0x00000004
+                ldr     r1, =0xDEADBEEF
+                ldr     r2, [r0, #0]
+                str     r0, [r0, #0]
+                cmp     r2, r1
+                beq     bootloader
+
                 /* Interrupts are globally masked initially.*/
                 cpsid   i
 
@@ -304,6 +311,11 @@ endfiniloop:
 
                 /* Branching to the defined exit handler.*/
                 b       __default_exit
+bootloader:
+                ldr     r0, =0x1FFFD800
+                ldr     sp,[r0, #0]
+                ldr     r0,[r0, #4]
+                bx      r0
 
 #endif /* !defined(__DOXYGEN__) */
 
