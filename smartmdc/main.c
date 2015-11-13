@@ -20,11 +20,8 @@
 #include "usbcfg.h"
 #include "mma8451.h"
 
-/* MMA8451Q address used. */
-#define MMA8451_ADDR            MMA8451_ADDR_HIGH
-
 /* Low-pass filter coefficients. */
-#define ACC_LPF_A               100
+#define ACC_LPF_A               128
 #define ACC_LPF_B               (ACC_LPF_A - 1)
 
 /* DAC channels. */
@@ -69,73 +66,44 @@ static const DACConfig dac1cfg2 = {
 
 /* ADC1_2 samples. */
 static adcsample_t samplesAD[ADC_GRP1_NUM_CHANNELS * ADC_GRP1_BUF_DEPTH];
+static adcsample_t *bufferAD;
 /* ADC3_4 samples. */
 static adcsample_t samplesCB[ADC_GRP2_NUM_CHANNELS * ADC_GRP2_BUF_DEPTH];
+static adcsample_t *bufferCB;
 /* Filtered values of A, B, C and D channels. */
-static adcsample_t sumAD = 0;
-static adcsample_t sumCB = 0;
-static adcsample_t diffAD = 0;
-static adcsample_t diffCB = 0;
-static adcsample_t sum4Seg = 0;
-static adcsample_t diff4Seg = 0;
+static uint16_t sum4Seg = 0;
+static int16_t diff4Seg = 0;
 
-/* Counting semaphore for ADC synchronization. */
-SEMAPHORE_DECL(semADCReady, 2);
+/* Binary semaphore for ADC synchronization. */
+static BSEMAPHORE_DECL(bsemADCReady, TRUE);
+/* Mutex for data transfer. */
+static MUTEX_DECL(m1);
 
 /*
  * ADC streaming callback for A and D channels.
  */
 static void adccallbackAD(ADCDriver *adcp, adcsample_t *buffer, size_t n) {
-  uint32_t sumA = 0;
-  uint32_t sumD = 0;
-  size_t i = n;
-  adcsample_t avgA, avgD;
-
   (void)adcp;
-  do {
-    sumA += *buffer++;
-    sumD += *buffer++;
-  } while (--i);
-
-  avgA = (adcsample_t)(sumA / n);
-  avgD = (adcsample_t)(sumD / n);
-
-  sumAD = avgA + avgD;
-  diffAD = avgA - avgD;
-
-  /* Change state of the synchronizing semaphore. */
-  chSemSignalI(&semADCReady);
+  (void)n;
+  bufferAD = buffer;
 }
 
 /*
  * ADC streaming callback for C and B channels.
  */
 static void adccallbackCB(ADCDriver *adcp, adcsample_t *buffer, size_t n) {
-  uint32_t sumC = 0;
-  uint32_t sumB = 0;
-  size_t i = n;
-  adcsample_t avgC, avgB;
-
   (void)adcp;
-  do {
-    sumC += *buffer++;
-    sumB += *buffer++;
-  } while (--i);
-
-  avgC = (adcsample_t)(sumC / n);
-  avgB = (adcsample_t)(sumB / n);
-
-  sumCB = avgC + avgB;
-  diffCB = avgC - avgB;
+  (void)n;
+  bufferCB = buffer;
 
   /* Change state of the synchronizing semaphore. */
-  chSemSignalI(&semADCReady);
+  chBSemSignalI(&bsemADCReady);
 }
 
 /*
  * ADC1_2 conversion group.
  * Mode:        Continuous, 16 samples of 2 channels, SW triggered,
- *              12 000 000 / 614 = 19544 sps.
+ *              12 000 000 / 614 = 19 544 sps.
  * Channels:    ADC1_CH1-(A), ADC2_CH3-(D).
  */
 static const ADCConversionGroup adcgrpcfg1 = {
@@ -210,6 +178,10 @@ SerialUSBDriver SDU1;
 /* Console input/output handle. */
 BaseChannel *g_chnp = NULL;
 
+/* MMA8451Q accelerometer address. */
+static i2caddr_t mma8451Addr = 0;
+/* Main thread termination flag. */
+static bool fRunMain = TRUE;
 /* Raw accel data. */
 static AccDataStruct rawData = {0, 0, 0};
 /* Filtered accel data. */
@@ -218,12 +190,15 @@ static AccDataStruct filteredData = {0, 0, 0};
 /*
  * Blinker thread (low priority).
  */
-static THD_WORKING_AREA(waBlinker, 128);
+static THD_WORKING_AREA(waBlinker, 64);
 static THD_FUNCTION(Blinker, arg) {
   (void)arg;
 
-  while (true) {
+  while (!chThdShouldTerminateX()) {
     palTogglePad(GPIOB, GPIOB_LED_A);
+    if (g_i2cErrors || g_i2cTimeouts) {
+      palTogglePad(GPIOB, GPIOB_LED_B);
+    }
 
     if (serusbcfg.usbp->state == USB_ACTIVE) {
       chThdSleepMilliseconds(250);
@@ -242,8 +217,8 @@ static THD_FUNCTION(AccPoller, arg) {
   systime_t time = chVTGetSystemTime();
   int32_t temp;
 
-  while (true) {
-    if (mma8451GetNewData(MMA8451_ADDR, &rawData)) {
+  while (!chThdShouldTerminateX()) {
+    if (mma8451GetNewData(mma8451Addr, &rawData) && chMtxTryLock(&m1)) {
       temp = ((int32_t)filteredData.x * ACC_LPF_B + rawData.x) / ACC_LPF_A;
       filteredData.x = (int16_t)temp;
 
@@ -252,28 +227,51 @@ static THD_FUNCTION(AccPoller, arg) {
 
       temp = ((int32_t)filteredData.z * ACC_LPF_B + rawData.z) / ACC_LPF_A;
       filteredData.z = (int16_t)temp;
+
+      chMtxUnlock(&m1);
     }
-    /* Wait until the next 5 milliseconds passes. */
-    chThdSleepUntil(time += MS2ST(5));
+    /* Wait until the next 2.5 milliseconds passes. */
+    chThdSleepUntil(time += US2ST(2500));
   }
 }
 
 /*
  * ADC data processing thread (the highest priority).
  */
-static THD_WORKING_AREA(waADCProcessor, 512);
+static THD_WORKING_AREA(waADCProcessor, 256);
 static THD_FUNCTION(ADCProcessor, arg) {
   (void)arg;
+  size_t n;
+  adcsample_t tmp1, tmp2;
+  uint32_t sumAD, sumCB;
+  int32_t diffAD, diffCB;
 
-  while (true) {
-    if (chSemWait(&semADCReady) == MSG_OK) {
-      sum4Seg  = sumAD + sumCB;
-      /* (A-D)-(B-C) =
-       *  A-D - B+C  =
-       *  A-D + C-B  =
-       * (A-D)+(C-B);
-       */
-      diff4Seg = diffAD + diffCB;
+  while (!chThdShouldTerminateX()) {
+    if (chBSemWait(&bsemADCReady) == MSG_OK) {
+      sumAD = sumCB = 0;
+      diffAD = diffCB = 0;
+      for (n = 0; n < ADC_BUFFER_DEPTH; n++) {
+        tmp1 = *bufferAD++;
+        tmp2 = *bufferAD++;
+        sumAD += tmp1 + tmp2;
+        diffAD += tmp1 - tmp2;
+
+        tmp1 = *bufferCB++;
+        tmp2 = *bufferCB++;
+        sumCB += tmp1 + tmp2;
+        diffCB += tmp1 - tmp2;
+      }
+
+      if (chMtxTryLock(&m1)) {
+        sum4Seg  = (sumAD + sumCB) / ADC_BUFFER_DEPTH;
+        /* (A-D)-(B-C) =
+         *  A-D - B+C  =
+         *  A-D + C-B  =
+         * (A-D)+(C-B);
+         */
+        diff4Seg = (diffAD + diffCB) / ADC_BUFFER_DEPTH;
+        chMtxUnlock(&m1);
+      }
     }
   }
 }
@@ -288,13 +286,26 @@ static void processCommands(void)
 
   switch (ch) {
   case 'a': /* Sends raw accelerometer data. */
+    chMtxLock(&m1);
     chnWrite(g_chnp, (const uint8_t *)&filteredData, sizeof(filteredData));
+    chMtxUnlock(&m1);
     break;
   case 'b': /* Sends sum of four segment data. */
+    chMtxLock(&m1);
     chnWrite(g_chnp, (const uint8_t *)&sum4Seg, sizeof(sum4Seg));
+    chMtxUnlock(&m1);
     break;
   case 'c': /* Sends difference of four segment data. */
+    chMtxLock(&m1);
     chnWrite(g_chnp, (const uint8_t *)&diff4Seg, sizeof(diff4Seg));
+    chMtxUnlock(&m1);
+    break;
+  case 'd': /* Shuts down the controller. */
+    chnWrite(g_chnp, (const uint8_t *)&g_i2cErrors, sizeof(g_i2cErrors));
+    chnWrite(g_chnp, (const uint8_t *)&g_i2cTimeouts, sizeof(g_i2cTimeouts));
+    break;
+  case 'x': /* Shuts down the controller. */
+    fRunMain = FALSE;
     break;
   case '1': /* Updates position of the FOC actuator (0x31 hex; 49 dec). */
     chnRead(g_chnp, (uint8_t *)&utmp16, sizeof(utmp16));
@@ -315,6 +326,10 @@ static void processCommands(void)
  * Application entry point (normal priority).
  */
 int main(void) {
+  thread_t *pThdADCProcessor = NULL;
+  thread_t *pThdAccPoller    = NULL;
+  thread_t *pThdBlinker      = NULL;
+
   /*
    * System initializations.
    * - HAL initialization, this also initializes the configured device drivers
@@ -325,9 +340,7 @@ int main(void) {
   halInit();
   chSysInit();
 
-  /*
-   * Initializes a serial-over-USB CDC driver.
-   */
+  /* Initializes a serial-over-USB CDC driver. */
   sduObjectInit(&SDU1);
   sduStart(&SDU1, &serusbcfg);
 
@@ -341,53 +354,51 @@ int main(void) {
   usbStart(serusbcfg.usbp, &usbcfg);
   usbConnectBus(serusbcfg.usbp);
 
-  /*
-   * Starts I2C1 driver.
-   */
+  /* Starts I2C1 driver. */
   i2cStart(&I2CD1, &i2cfg1);
-  
-  /*
-   * Starts DAC1 driver channel #1 and channel #2.
-   */
+
+  /* Starts DAC1 driver channel #1 and channel #2. */
   dacStart(&DACD1, &dac1cfg1);
   dacStart(&DACD2, &dac1cfg2);
-  
-  /*
-   * Activates the ADC1 driver and the ADC3 driver.
-   */
+
+  /* Activates the ADC1 driver and the ADC3 driver. */
   adcStart(&ADCD1, NULL);
   adcStart(&ADCD3, NULL);
 
-  /*
-   * Initialize MMA8451Q accelerometer.
-   */
-  if (mma8451Init(MMA8451_ADDR)) {
-    /* Creates the accelerometer polling thread. */
-    chThdCreateStatic(waAccPoller, sizeof(waAccPoller), NORMALPRIO + 1, AccPoller, NULL);
+  /* Initialize MMA8451Q accelerometer. */
+  if (mma8451Init(MMA8451_ADDR_LOW)) {
+    mma8451Addr = MMA8451_ADDR_LOW;
+  } else if (mma8451Init(MMA8451_ADDR_HIGH)) {
+    mma8451Addr = MMA8451_ADDR_HIGH;
+    g_i2cErrors = 0;
+    g_i2cTimeouts = 0;
   } else {
+    mma8451Addr = 0;
+    g_i2cErrors = 0;
+    g_i2cTimeouts = 0;
     palSetPad(GPIOB, GPIOB_LED_B);
   }
-  
-  /*
-   * Creates the ADC data processing thread.
-   */
-  chThdCreateStatic(waADCProcessor, sizeof(waADCProcessor), HIGHPRIO, ADCProcessor, NULL);
 
-  /*
-   * Starts an ADC continuous conversion.
-   */
+  if (mma8451Addr) {
+    /* Creates the accelerometer polling thread. */
+    pThdAccPoller = chThdCreateStatic(waAccPoller, sizeof(waAccPoller),
+      NORMALPRIO + 1, AccPoller, NULL);
+  }
+
+  /* Creates the ADC data processing thread. */
+  pThdADCProcessor = chThdCreateStatic(waADCProcessor, sizeof(waADCProcessor),
+    HIGHPRIO, ADCProcessor, NULL);
+
+  /* Starts an ADC continuous conversion. */
   adcStartConversion(&ADCD1, &adcgrpcfg1, samplesAD, ADC_GRP1_BUF_DEPTH);
   adcStartConversion(&ADCD3, &adcgrpcfg2, samplesCB, ADC_GRP2_BUF_DEPTH);
 
-  /*
-   * Creates the blinker thread.
-   */
-  chThdCreateStatic(waBlinker, sizeof(waBlinker), LOWPRIO, Blinker, NULL);
+  /* Creates the blinker thread. */
+  pThdBlinker = chThdCreateStatic(waBlinker, sizeof(waBlinker),
+    LOWPRIO, Blinker, NULL);
 
-  /*
-   * Normal main() thread activity.
-   */
-  while (true) {
+  /* Normal main() thread activity. */
+  while (fRunMain) {
     g_chnp = serusbcfg.usbp->state == USB_ACTIVE ? (BaseChannel *)&SDU1 : NULL;
 
     if (g_chnp) {
@@ -396,4 +407,46 @@ int main(void) {
       chThdSleepMilliseconds(1000);
     }
   }
+
+  /* Starting the shut-down sequence.*/
+  adcStopConversion(&ADCD1);          /* Stopping ADC1_2 conversions.             */
+  adcStopConversion(&ADCD3);          /* Stopping ADC3_4 conversions.             */
+
+  if (pThdADCProcessor != NULL) {
+    chThdTerminate(pThdADCProcessor); /* Requesting termination.                  */
+    chBSemSignal(&bsemADCReady);
+    chThdWait(pThdADCProcessor);      /* Waiting for the actual termination.      */
+  }
+
+  if (pThdAccPoller != NULL) {
+    chThdTerminate(pThdAccPoller);    /* Requesting termination.                  */
+    chThdWait(pThdAccPoller);         /* Waiting for the actual termination.      */
+    mma8451Stop(mma8451Addr);
+  }
+
+  if (pThdBlinker != NULL) {
+    chThdTerminate(pThdBlinker);      /* Requesting termination.                  */
+    chThdWait(pThdBlinker);           /* Waiting for the actual termination.      */
+  }
+
+  adcStop(&ADCD1);                    /* Stopping ADC1_2 device.                  */
+  adcStop(&ADCD3);                    /* Stopping ADC3_4 device.                  */
+  dacStop(&DACD1);                    /* Stopping DAC1 device.                    */
+  dacStop(&DACD2);                    /* Stopping DAC2 device.                    */
+  i2cStop(&I2CD1);                    /* Stopping I2C1 device.                    */
+  usbStop(serusbcfg.usbp);            /* Stopping USB port.                       */
+  usbDisconnectBus(serusbcfg.usbp);
+  sduStop(&SDU1);                     /* Stopping serial-over-USB CDC driver.     */
+
+  chSysDisable();
+
+  /* Reset all peripherals. */
+  rccResetAPB1(0xFFFFFFFF);
+  rccResetAPB2(0xFFFFFFFF);
+
+  /* Reset micro-controller. */
+  NVIC_SystemReset();
+
+  /* This point should never be reached. */
+  return 0;
 }

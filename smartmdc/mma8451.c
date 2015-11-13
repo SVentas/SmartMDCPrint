@@ -36,13 +36,14 @@
 /**
  * G L O B A L   V A R I A B L E S
  */
+i2cflags_t g_i2cErrors = 0;
+uint32_t g_i2cTimeouts = 0;
 
 /**
  * L O C A L   V A R I A B L E S
  */
 static uint8_t rxbuf[ACCEL_RX_DEPTH];
 static uint8_t txbuf[ACCEL_TX_DEPTH];
-static i2cflags_t errors = 0;
 
 /**
  * Converts data from 2complemented representation to signed integer.
@@ -62,13 +63,37 @@ int16_t complement2signed(uint8_t msb, uint8_t lsb) {
 bool mma8451Init(i2caddr_t addr) {
   msg_t status = MSG_OK;
 
-  txbuf[0] = MMA8451_CTRL_REG1; /* register address */
-  txbuf[1] = 0x11; /* ODR = 200Hz; ACTIVE = 1 */
+  txbuf[0] = MMA8451_CTRL_REG1; /* register address        */
+  txbuf[1] = 0x09;              /* ODR = 400Hz; ACTIVE = 1 */
 
-  status = i2cMasterTransmitTimeout(&I2CD1, addr, txbuf, 2, rxbuf, 0, MMA8451_TRANSMIT_TIMEOUT);
+  status = i2cMasterTransmitTimeout(&I2CD1, addr, txbuf, 2,
+    rxbuf, 0, MMA8451_TRANSMIT_TIMEOUT);
 
   if (status != MSG_OK){
-    errors = i2cGetErrors(&I2CD1);
+    g_i2cErrors = i2cGetErrors(&I2CD1);
+    g_i2cTimeouts++;
+
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+/**
+ * Puts the accelerometer in standby mode.
+ */
+bool mma8451Stop(i2caddr_t addr) {
+  msg_t status = MSG_OK;
+
+  txbuf[0] = MMA8451_CTRL_REG1; /* register address */
+  txbuf[1] = 0x00;              /* ACTIVE = 0       */
+
+  status = i2cMasterTransmitTimeout(&I2CD1, addr, txbuf, 2,
+    rxbuf, 0, MMA8451_TRANSMIT_TIMEOUT);
+
+  if (status != MSG_OK){
+    g_i2cErrors = i2cGetErrors(&I2CD1);
+    g_i2cTimeouts++;
 
     return FALSE;
   }
@@ -84,10 +109,12 @@ bool mma8451GetNewData(i2caddr_t addr, PAccDataStruct pData) {
 
   txbuf[0] = MMA8451_OUT_DATA; /* register address */
 
-  status = i2cMasterTransmitTimeout(&I2CD1, addr, txbuf, 1, rxbuf, 6, MMA8451_TRANSMIT_TIMEOUT);
+  status = i2cMasterTransmitTimeout(&I2CD1, addr, txbuf, 1,
+    rxbuf, 6, MMA8451_TRANSMIT_TIMEOUT);
 
   if (status != MSG_OK){
-    errors = i2cGetErrors(&I2CD1);
+    g_i2cErrors = i2cGetErrors(&I2CD1);
+    g_i2cTimeouts++;
 
     pData->x = 0;
     pData->y = 0;

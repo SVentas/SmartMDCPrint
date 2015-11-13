@@ -30,11 +30,14 @@ typedef struct tagAccDataStruct {
 /**
  * G L O B A L   V A R I A B L E S
  */
+extern i2cflags_t g_i2cErrors;
+extern uint32_t g_i2cTimeouts;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
   bool mma8451Init(i2caddr_t addr);
+  bool mma8451Stop(i2caddr_t addr);
   bool mma8451GetNewData(i2caddr_t addr, PAccDataStruct pData);
 #ifdef __cplusplus
 }
